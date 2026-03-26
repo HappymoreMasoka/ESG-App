@@ -1,6 +1,10 @@
 from pathlib import Path
+import math
+import time
 import joblib
 import pandas as pd
+
+from telemetry import tracer, prediction_counter, prediction_latency
 
 MODEL_DIR = Path(__file__).resolve().parents[1] / "models"
 
@@ -40,42 +44,55 @@ def add_engineered_features(df: pd.DataFrame) -> pd.DataFrame:
         df["profitability_ratio"] = df["Net_income"] / (df["Total_assets"] + eps)
 
     if "Total_assets" in df.columns:
-        df["log_total_assets"] = pd.Series(df["Total_assets"]).clip(lower=0).apply(
-            lambda x: __import__("math").log1p(x)
-        )
+        df["log_total_assets"] = df["Total_assets"].clip(lower=0).apply(math.log1p)
 
     if "Market_cap" in df.columns:
-        df["log_market_cap"] = pd.Series(df["Market_cap"]).clip(lower=0).apply(
-            lambda x: __import__("math").log1p(x)
-        )
+        df["log_market_cap"] = df["Market_cap"].clip(lower=0).apply(math.log1p)
 
     return df
 
 
 def prepare_input(df: pd.DataFrame) -> pd.DataFrame:
-    df = add_date_features(df)
-    df = add_engineered_features(df)
-    return df
+    with tracer.start_as_current_span("prepare_input_features"):
+        df = add_date_features(df)
+        df = add_engineered_features(df)
+        return df
 
 
 class ESGPredictor:
     def __init__(self) -> None:
-        self.env_model = joblib.load(MODEL_DIR / "env_model.joblib")
-        self.social_model = joblib.load(MODEL_DIR / "social_model.joblib")
-        self.gov_model = joblib.load(MODEL_DIR / "gov_model.joblib")
+        with tracer.start_as_current_span("load_models"):
+            self.env_model = joblib.load(MODEL_DIR / "env_model.joblib")
+            self.social_model = joblib.load(MODEL_DIR / "social_model.joblib")
+            self.gov_model = joblib.load(MODEL_DIR / "gov_model.joblib")
 
     def predict(self, input_df: pd.DataFrame) -> dict:
-        prepared = prepare_input(input_df)
+        start = time.perf_counter()
 
-        env_score = float(self.env_model.predict(prepared)[0])
-        social_score = float(self.social_model.predict(prepared)[0])
-        gov_score = float(self.gov_model.predict(prepared)[0])
+        with tracer.start_as_current_span("predict_esg_scores") as span:
+            prepared = prepare_input(input_df)
 
-        esg_score = 0.33 * env_score + 0.33 * social_score + 0.34 * gov_score
+            env_score = float(self.env_model.predict(prepared)[0])
+            social_score = float(self.social_model.predict(prepared)[0])
+            gov_score = float(self.gov_model.predict(prepared)[0])
 
-        return {
-            "environmental_score": round(env_score, 2),
-            "social_score": round(social_score, 2),
-            "governance_score": round(gov_score, 2),
-            "esg_score": round(esg_score, 2),
-        }
+            esg_score = 0.33 * env_score + 0.33 * social_score + 0.34 * gov_score
+
+            duration_ms = (time.perf_counter() - start) * 1000
+
+            prediction_counter.add(1)
+            prediction_latency.record(duration_ms)
+
+            span.set_attribute("prediction.environmental_score", env_score)
+            span.set_attribute("prediction.social_score", social_score)
+            span.set_attribute("prediction.governance_score", gov_score)
+            span.set_attribute("prediction.esg_score", esg_score)
+            span.set_attribute("prediction.latency_ms", duration_ms)
+
+            return {
+                "environmental_score": round(env_score, 2),
+                "social_score": round(social_score, 2),
+                "governance_score": round(gov_score, 2),
+                "esg_score": round(esg_score, 2),
+                "latency_ms": round(duration_ms, 2),
+            }
